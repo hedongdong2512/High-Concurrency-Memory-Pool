@@ -1,0 +1,18 @@
+# 构建产物
+*.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+Debug/
+Release/
+x64/
+Win32/
+.vs/
+*.VC.db
+*.VC.opendb
+
+# 系统文件
+.DS_Store
+Thumbs.db
