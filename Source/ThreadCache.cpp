@@ -1,5 +1,14 @@
 #include "ThreadCache.h"
 #include "CentralCache.h"
+#include <algorithm>
+
+#if defined(_WIN32)
+#include <intrin.h>
+// 预取：把目标地址所在的缓存行提前加载进 L1 缓存，缩短下次访问的访存延迟
+#define MP_PREFETCH(addr) _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0)
+#else
+#define MP_PREFETCH(addr) __builtin_prefetch(addr)
+#endif
 
 namespace gzq_memoryPool
 {
@@ -20,18 +29,26 @@ namespace gzq_memoryPool
 
         size_t index = SizeClass::getIndex(size);//获取一个与size对应的索引值
 
-        // 更新对应自由链表的长度计数
-        freeListSize_[index]--;
-
         // 检查线程本地自由链表
         // 如果 freeList_[index] 不为空，表示该链表中有可用内存块
         if (void* ptr = freeList_[index])
         {
-            freeList_[index] = *reinterpret_cast<void**>(ptr); // 将freeList_[index]指向的内存块的下一个内存块地址（取决于内存块的实现）
+            // 将链表头后移一位
+            freeList_[index] = *reinterpret_cast<void**>(ptr);
+            // 更新对应自由链表的长度计数
+            freeListSize_[index]--;
+
+            // 预取下一个空闲块：同一线程大概率很快再次分配同类内存，
+            // 提前把下一块所在缓存行加载进 L1，降低下次分配的访存延迟
+            if (freeList_[index] != nullptr)
+            {
+                MP_PREFETCH(freeList_[index]);
+            }
+
             return ptr;
         }
 
-        // 如果线程本地自由链表为空，则从中心缓存获取一批内存
+        // 如果线程本地自由链表为空，则按动态批量从中心缓存获取一批内存
         return fetchFromCentralCache(index);
     }
 
@@ -69,27 +86,39 @@ namespace gzq_memoryPool
 
     void* ThreadCache::fetchFromCentralCache(size_t index)
     {
-        // 从中心缓存批量获取内存
-        void* start = CentralCache::getInstance().fetchRange(index);
+        // 动态批量：按该大小类的历史使用情况决定本次申请的块数，
+        // 而不是固定值——繁忙的大小类申请更多，闲置的大小类申请更少
+        size_t want = batchHint_[index];
+
+        // 从中心缓存批量获取内存（返回块链表头）
+        void* start = CentralCache::getInstance().fetchRange(index, want);
         if (!start) return nullptr;
 
-        // 取一个返回，其余放入自由链表
+        // 统计本次实际拿到的块数，并把整条链表接到本地自由链表
+        size_t got = 0;
+        void* cur = start;
+        void* tail = nullptr;
+        while (cur != nullptr)
+        {
+            tail = cur;
+            got++;
+            cur = *reinterpret_cast<void**>(cur); // 遍历下一个内存块
+        }
+        if (tail != nullptr)
+        {
+            *reinterpret_cast<void**>(tail) = freeList_[index];
+        }
+        freeList_[index] = start;
+        freeListSize_[index] += got;
+
+        // 取第一块返回，其余留在本地自由链表
         void* result = start;
         freeList_[index] = *reinterpret_cast<void**>(start);
+        freeListSize_[index]--;
 
-        // 更新自由链表大小
-        size_t batchNum = 0;
-        void* current = start; // 从start开始遍历
-
-        // 计算从中心缓存获取的内存块数量
-        while (current != nullptr)
-        {
-            batchNum++;
-            current = *reinterpret_cast<void**>(current); // 遍历下一个内存块
-        }
-
-        // 更新freeListSize_，增加获取的内存块数量
-        freeListSize_[index] += batchNum;
+        // 需求驱动增长：本地链表耗尽才触发本次补充，说明该大小类分配频繁，
+        // 下次申请量翻倍（封顶 BATCH_MAX），减少来回找 CentralCache 的频率
+        batchHint_[index] = std::min(batchHint_[index] * 2, BATCH_MAX);
 
         return result;
     }
@@ -141,6 +170,10 @@ namespace gzq_memoryPool
             if (returnNum > 0 && nextNode != nullptr)
             {
                 CentralCache::getInstance().returnRange(nextNode, returnNum * alignedSize, index);
+
+                // 闲置驱动收缩：本地块大量闲置到触发回收，说明批量偏大，
+                // 下次申请量减半（保底 BATCH_MIN），避免内存长期滞留在本地缓存
+                batchHint_[index] = std::max(batchHint_[index] / 2, BATCH_MIN);
             }
         }
     }

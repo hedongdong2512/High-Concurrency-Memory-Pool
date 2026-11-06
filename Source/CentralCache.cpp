@@ -18,30 +18,20 @@ namespace gzq_memoryPool
         {
             ptr.store(nullptr, std::memory_order_relaxed);
         }
-        for (auto& lock : locks_)
-        {
-            lock.clear();
-        }
-        // 初始化延迟归还相关的成员变量
-        for (auto& count : delayCounts_)
-        {
-            count.store(0, std::memory_order_relaxed);
-        }
-        for (auto& time : lastReturnTimes_)
-        {
-            time = std::chrono::steady_clock::now();
-        }
         spanCount_.store(0, std::memory_order_relaxed);
+        // bucketCtl_ 由自身构造函数初始化（锁清零、延迟归还计时起点），无需额外处理
     }
 
-    void* CentralCache::fetchRange(size_t index)
+    void* CentralCache::fetchRange(size_t index, size_t batchNum)
     {
         // 索引检查，当索引大于等于FREE_LIST_SIZE时，说明申请内存过大应直接向系统申请
-        if (index >= FREE_LIST_SIZE)
+        if (index >= FREE_LIST_SIZE || batchNum == 0)
             return nullptr;
 
+        BucketCtl& ctl = bucketCtl_[index];
+
         // 自旋锁保护
-        while (locks_[index].test_and_set(std::memory_order_acquire))
+        while (ctl.lock.test_and_set(std::memory_order_acquire))
         {
             std::this_thread::yield(); // 添加线程让步，避免忙等待，避免过度消耗CPU
         }
@@ -49,18 +39,15 @@ namespace gzq_memoryPool
         void* result = nullptr;
         try
         {
-            // 尝试从中心缓存获取内存块
-            result = centralFreeList_[index].load(std::memory_order_relaxed);
-
-            if (!result)
+            if (!centralFreeList_[index].load(std::memory_order_relaxed))
             {
-                // 如果中心缓存为空，从页缓存获取新的内存块
+                // 中心缓存为空：从页缓存获取新的内存块
                 size_t size = (index + 1) * ALIGNMENT;
                 result = fetchFromPageCache(size);
 
                 if (!result)
                 {
-                    locks_[index].clear(std::memory_order_release);
+                    ctl.lock.clear(std::memory_order_release);
                     return nullptr;
                 }
 
@@ -83,15 +70,21 @@ namespace gzq_memoryPool
                     }
                     *reinterpret_cast<void**>(start + (blockNum - 1) * size) = nullptr;
 
-                    // 保存result的下一个节点
-                    void* next = *reinterpret_cast<void**>(result);
-                    // 将result与链表断开
-                    *reinterpret_cast<void**>(result) = nullptr;
-                    // 更新中心缓存
-                    centralFreeList_[index].store(
-                        next,
-                        std::memory_order_release
-                    );
+                    // 动态批量：本次实际交给 ThreadCache 的块数由调用方需求决定，
+                    // 不再固定只给 1 块，也不是盲目全给，减少 ThreadCache 频繁回中心缓存的次数
+                    size_t give = batchNum < blockNum ? batchNum : blockNum;
+
+                    // 找到切断点：前 give 块返回给 ThreadCache，其余留在中心缓存
+                    void* cutNode = start;
+                    for (size_t i = 0; i < give - 1; ++i)
+                    {
+                        cutNode = *reinterpret_cast<void**>(cutNode);
+                    }
+                    void* rest = *reinterpret_cast<void**>(cutNode);
+                    *reinterpret_cast<void**>(cutNode) = nullptr;
+
+                    // 剩余块挂到中心缓存自由链表
+                    centralFreeList_[index].store(rest, std::memory_order_release);
 
                     // 使用无锁方式记录span信息
                     size_t trackerIndex = spanCount_++;
@@ -99,38 +92,52 @@ namespace gzq_memoryPool
                     {
                         spanTrackers_[trackerIndex].spanAddr.store(start, std::memory_order_release);
                         spanTrackers_[trackerIndex].numPages.store(numPages, std::memory_order_release);
-                        spanTrackers_[trackerIndex].blockCount.store(blockNum, std::memory_order_release); // 共分配了blockNum个内存块
-                        spanTrackers_[trackerIndex].freeCount.store(blockNum - 1, std::memory_order_release); // 第一个块result已被分配出去，所以初始空闲块数为blockNum - 1
+                        spanTrackers_[trackerIndex].blockCount.store(blockNum, std::memory_order_release);
+                        // 前 give 块已分配给 ThreadCache，初始空闲块数为 blockNum - give
+                        spanTrackers_[trackerIndex].freeCount.store(blockNum - give, std::memory_order_release);
                     }
                 }
             }
             else
             {
-                // 保存result的下一个节点
-                void* next = *reinterpret_cast<void**>(result);
-                // 将result与链表断开
-                *reinterpret_cast<void**>(result) = nullptr;
+                // 中心缓存有存货：从链表头取最多 batchNum 块
+                void* head = centralFreeList_[index].load(std::memory_order_relaxed);
 
-                // 更新中心缓存
-                centralFreeList_[index].store(next, std::memory_order_release);
-
-                // 更新span的空闲计数
-                SpanTracker* tracker = getSpanTracker(result);
-                if (tracker)
+                size_t popped = 1;
+                void* cur = head;
+                while (popped < batchNum && *reinterpret_cast<void**>(cur) != nullptr)
                 {
-                    // 减少一个空闲块
-                    tracker->freeCount.fetch_sub(1, std::memory_order_release);
+                    cur = *reinterpret_cast<void**>(cur);
+                    popped++;
+                }
+
+                // 断开：前 popped 块返回给 ThreadCache，剩余部分留为中心缓存链表
+                void* rest = *reinterpret_cast<void**>(cur);
+                *reinterpret_cast<void**>(cur) = nullptr;
+                centralFreeList_[index].store(rest, std::memory_order_release);
+                result = head;
+
+                // 每个被取走的块找到所属 span，减少其空闲计数
+                void* block = result;
+                while (block != nullptr)
+                {
+                    SpanTracker* tracker = getSpanTracker(block);
+                    if (tracker)
+                    {
+                        tracker->freeCount.fetch_sub(1, std::memory_order_release);
+                    }
+                    block = *reinterpret_cast<void**>(block);
                 }
             }
         }
         catch (...)
         {
-            locks_[index].clear(std::memory_order_release);
+            ctl.lock.clear(std::memory_order_release);
             throw;
         }
 
         // 释放锁
-        locks_[index].clear(std::memory_order_release);
+        ctl.lock.clear(std::memory_order_release);
         return result;
     }
 
@@ -142,7 +149,9 @@ namespace gzq_memoryPool
         size_t blockSize = (index + 1) * ALIGNMENT;
         size_t blockCount = size / blockSize;
 
-        while (locks_[index].test_and_set(std::memory_order_acquire))
+        BucketCtl& ctl = bucketCtl_[index];
+
+        while (ctl.lock.test_and_set(std::memory_order_acquire))
         {
             std::this_thread::yield();
         }
@@ -161,7 +170,7 @@ namespace gzq_memoryPool
             centralFreeList_[index].store(start, std::memory_order_release);
 
             // 2. 更新延迟计数
-            size_t currentCount = delayCounts_[index].fetch_add(1, std::memory_order_relaxed) + 1;
+            size_t currentCount = ctl.delayCount.fetch_add(1, std::memory_order_relaxed) + 1;
             auto currentTime = std::chrono::steady_clock::now();
 
             // 3. 检查是否需要执行延迟归还
@@ -172,11 +181,11 @@ namespace gzq_memoryPool
         }
         catch (...)
         {
-            locks_[index].clear(std::memory_order_release);
+            ctl.lock.clear(std::memory_order_release);
             throw;
         }
 
-        locks_[index].clear(std::memory_order_release);
+        ctl.lock.clear(std::memory_order_release);
     }
 
     // 检查是否需要执行延迟归还
@@ -189,7 +198,7 @@ namespace gzq_memoryPool
             return true;
         }
 
-        auto lastTime = lastReturnTimes_[index];
+        auto lastTime = bucketCtl_[index].lastReturnTime;
         return (currentTime - lastTime) >= DELAY_INTERVAL;
     }
 
@@ -197,9 +206,9 @@ namespace gzq_memoryPool
     void CentralCache::performDelayedReturn(size_t index)
     {
         // 重置延迟计数
-        delayCounts_[index].store(0, std::memory_order_relaxed);
+        bucketCtl_[index].delayCount.store(0, std::memory_order_relaxed);
         // 更新最后归还时间
-        lastReturnTimes_[index] = std::chrono::steady_clock::now();
+        bucketCtl_[index].lastReturnTime = std::chrono::steady_clock::now();
 
         // 统计每个span的空闲块数
         std::unordered_map<SpanTracker*, size_t> spanFreeCounts;

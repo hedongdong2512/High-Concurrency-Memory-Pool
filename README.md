@@ -20,7 +20,10 @@ PageCache    ──页缓存，向系统申请内存，负责 span 的分割与�
 
 - 8 字节对齐的大小类划分（Size Class），自由链表管理小块内存
 - 线程本地缓存无锁分配，中心缓存分桶自旋锁降低锁竞争
-- 批量申请 + 按比例归还（ThreadCache 超过阈值时保留 1/4，其余归还 CentralCache）
+- 动态批量分配：ThreadCache 按各大小类的使用情况自适应调整向 CentralCache 的申请量（耗尽触发则翻倍增长、闲置回收则减半收缩），繁忙路径减少跨层请求频率，闲置路径减少内存滞留
+- 缓存行填充：`SpanTracker` 与每个大小类的锁/延迟归还状态均按 `alignas(64)` 独占缓存行，消除多线程更新相邻桶计数时的伪共享
+- 预取优化：`allocate` 命中本地自由链表时预取下一空闲块（`_mm_prefetch`/`__builtin_prefetch`），降低连续分配的访存延迟
+- 批量归还 + 按比例回收（ThreadCache 超过阈值时保留 1/4，其余归还 CentralCache）
 - 延迟归还机制：CentralCache 按计数/时间窗口批量检查 span 空闲情况
 - 原子操作配合 `memory_order_relaxed / acquire / release` 控制同步开销
 
@@ -43,4 +46,12 @@ gzq_memoryPool::MemoryPool::deallocate(p, 64);
 - 4 线程并发分配 + 批量释放（每线程 2.5 万次）
 - 混合大小分配（10 万次，小/中/大对象按 60/30/10 比例）
 
-运行前会先预热，测试涵盖内存池的复用与回收路径。
+参考数据（i5 笔记本 / Windows / MSVC 19.42 /O2，仅供量级参考）：
+
+| 场景 | 内存池 | new/delete |
+|---|---|---|
+| 单线程小对象（5 万次） | ~4.1 ms | ~7.5 ms |
+| 混合大小（10 万次） | ~4.2 ms | ~8.7 ms |
+| 4 线程并发（4×2.5 万次） | ~8.6 ms | ~4.2 ms |
+
+> 多线程场景在本机暂慢于 `new/delete`：现代 MSVC 堆本身做了 per-thread 缓存，而本实现的 CentralCache 在少数几个大小类上竞争同一把自旋锁、`getSpanTracker` 为 O(n) 线性查找。已知改进方向：按 CPU/NUMA 分片 CentralCache、用页号哈希把 span 查找降到 O(1)——这是项目的下一步计划。
